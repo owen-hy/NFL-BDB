@@ -1,0 +1,288 @@
+---
+title: "BDB"
+output: html_document
+date: "2024-12-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading in Libraries and Data
+
+```{r}
+library(tidyverse)
+library(glmnet)
+library(car)
+library(pROC)
+library(knitr)
+library(performance)
+library(patchwork)
+set.seed(123)
+target <- read_csv("targets_dropback.csv") |>
+  select(gameId, playId, is_pressure, isSack)
+pressure <- read_csv("features_dropbacks.csv") |>
+  left_join(target, by = c('gameId', 'playId')) |>
+  mutate(motion = fly | glide_in | glide_out | jet | other_motion,
+         pressure_play = is_pressure | isSack) |>
+  select(-`...1`) 
+```
+
+## Dataset to be worked on
+
+```{r}
+pressure_adj <- pressure |>
+  select(-motion, -gameId, -playId, -isSack, -is_pressure) |>
+  mutate(`fly:num_playersRushing` = fly * num_playersRushing,
+         `glide_in:num_playersRushing` = glide_in * num_playersRushing,
+         `glide_out:num_playersRushing` = glide_out * num_playersRushing,
+         `jet:num_playersRushing` = jet * num_playersRushing,
+         `other_motion:numPlayersRushing` = other_motion * num_playersRushing,
+         `fly:down_two` = fly * down_two,
+         `glide_in:down_two` = glide_in * down_two,
+         `glide_out:down_two` = glide_out * down_two,
+         `jet:down_two` = jet * down_two,
+         `other_motion:down_two` = other_motion * down_two, 
+         `fly:down_three` = fly * down_three,
+         `glide_in:down_three` = glide_in * down_three,
+         `glide_out:down_three` = glide_out * down_three,
+         `jet:down_three` = jet * down_three,
+         `other_motion:down_three` = other_motion * down_three)
+```
+
+## EDA 
+
+```{r}
+pressure |>
+  group_by(pressure_play) |>
+  summarize(count = n(),
+            with_motion = mean(motion)) |>
+  ggplot(aes(x = pressure_play, y = with_motion, fill = pressure_play)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("FALSE" = "red", "TRUE" = "blue")) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(x = "Offense Experienced Pressure or Sack",
+       y = "Motion Occurred Before the Snap",
+       title = "Proportions of Pre Snap Motion during Offensive Snaps with/without Pressure/Sack",
+       caption = "Owen Yoo | Ben Weber | Eliana Detata | Bryce Carson") +
+  theme(plot.title = element_text(size = 10))
+
+```
+
+## Training and Test Set
+
+```{r}
+train_idx <- sample(1:nrow(pressure_adj), size = floor(0.7 * nrow(pressure_adj)))
+
+train <- pressure_adj[train_idx, ]
+test <- pressure_adj[-train_idx, ]
+```
+
+## Full Logistic Model
+
+```{r}
+logit_full <- glm(pressure_play ~ ., data = train, family = "binomial")
+summary(logit_full)
+full_predict <- predict(logit_full, test, type = "response")
+
+roc_full <- roc(test$pressure_play, full_predict)
+auc_full<- auc(roc_full)
+full_plot <- plot(roc_full)
+```
+
+## Multicollinearity
+
+```{r}
+vif(logit_full)
+```
+
+# Greedy Approaches 
+
+```{r}
+logit_empty <- glm(pressure_play ~ 1, data = train, family = binomial)
+```
+
+## Forward AIC
+
+```{r}
+forward_aic <- step(logit_empty, scope = list(lower = logit_empty, upper = logit_full), direction = "forward", trace = F)
+summary(forward_aic)
+forward_aic_pred <- predict(forward_aic, test, type = "response")
+
+roc_foraic <- roc(test$pressure_play, forward_aic_pred)
+auc_foraic <- auc(roc_foraic)
+foraic_plot <- plot(roc_foraic)
+```
+
+## Backward AIC
+
+```{r}
+backward_aic <- step(logit_full, direction = "backward", trace = F)
+summary(backward_aic)
+backward_aic_pred <- predict(backward_aic, test, type = "response")
+
+roc_backaic <- roc(test$pressure_play, backward_aic_pred)
+auc_backaic<- auc(roc_backaic)
+backaic_plot <- plot(roc_backaic)
+```
+
+## Forward BIC
+
+```{r}
+n <- nrow(train)
+forward_bic <- step(logit_empty, scope = list(lower = logit_empty, upper = logit_full), direction = "forward", trace = F,
+                    k = log(n))
+summary(forward_bic)
+forward_bic_pred <- predict(forward_bic, test, type = "response")
+
+roc_forbic <- roc(test$pressure_play, forward_bic_pred)
+auc_forbic<- auc(roc_forbic)
+forbic_plot <- plot(roc_forbic)
+```
+
+## Backward BIC
+
+```{r}
+backward_bic <- step(logit_full, direction = "backward", trace = F, k = log(n))
+summary(backward_bic)
+backward_bic_pred <- predict(backward_bic, test, type = "response")
+
+roc_backbic <- roc(test$pressure_play, backward_bic_pred)
+auc_backbic <- auc(roc_backbic)
+backbic_plot <- plot(roc_backbic)
+
+```
+
+## Lasso w/ Cross Validation
+
+```{r}
+x <- train |>
+  select(-pressure_play) |>
+  as.matrix()
+y <- as.matrix(train[, "pressure_play"])
+x_test <- test |>
+  select(-pressure_play) |>
+  as.matrix()
+
+
+lasso <- glmnet(x, y, family = "binomial", alpha = 1)
+cv_lasso <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+coef(cv_lasso, s = "lambda.min")
+
+lasso_pred <- predict(cv_lasso, s = 'lambda.min', newx = x_test, type = "response")
+roc_lasso <- roc(test$pressure_play, as.vector(lasso_pred))
+auc_lasso <- auc(roc_lasso)
+lasso_plot <- plot(roc_lasso)
+```
+
+
+## Ridge Regression
+
+```{r}
+ridge <- glmnet(x, y, family = "binomial", alpha = 0)
+cv_ridge <- cv.glmnet(x, y, family = "binomial", alpha = 0)
+coef(cv_ridge, s = "lambda.min")
+
+ridge_pred <- predict(cv_ridge, s = 'lambda.min', newx = x_test, type = "response")
+roc_ridge <- roc(test$pressure_play, as.vector(ridge_pred))
+auc_ridge <- auc(roc_ridge)
+ridge_plot <- plot(roc_ridge)
+```
+
+## Selecting Model
+
+```{r}
+model_select <- data.frame(`Model Type` = c("Full Model", "Forward AIC", "Backward AIC", "Forward BIC", "Backward BIC", "LASSO", "Ridge Regression"),
+                           `Model AUC` = c(auc_full, auc_foraic, auc_backaic, auc_forbic, auc_backbic, auc_lasso, auc_ridge))
+kable(model_select)
+```
+
+## ROC Curve Grid
+
+```{r}
+curveGen <- function(rocObj){
+  df <- data.frame(yAxis = rev(rocObj$sensitivities),
+                   xAxis = rev(1 - rocObj$specificities))
+  df |>
+    ggplot(aes(xAxis, yAxis)) +
+    geom_line() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = 'grey') +
+    labs(x = 'Specificity', y = 'Sensitivity') +
+    theme_bw()
+}
+plot1 <- curveGen(full_plot) + labs(title = 'ROC Curve of Full Model') + theme(plot.title = element_text(size = 6))
+plot2 <- curveGen(foraic_plot) + labs(title = 'ROC Curve of Forward AIC Model') + theme(plot.title = element_text(size = 6))
+plot3 <- curveGen(backaic_plot) + labs(title = 'ROC Curve of Backward AIC Model') + theme(plot.title = element_text(size = 6))
+plot4 <- curveGen(forbic_plot) + labs(title = 'ROC Curve of Forward BIC Model') + theme(plot.title = element_text(size = 6))
+plot5 <- curveGen(backbic_plot) + labs(title = 'ROC Curve of Backward BIC Model') + theme(plot.title = element_text(size = 6))
+plot6 <- curveGen(lasso_plot) + labs(title = 'ROC Curve of LASSO Model') + theme(plot.title = element_text(size = 6))
+plot7 <- curveGen(ridge_plot) + labs(title = 'ROC Curve of Ridge Regression Model', caption = "Owen Yoo | Ben Weber | Eliana Detata | Bryce Carson") + theme(plot.title = element_text(size = 5))
+(plot1 | plot2 | plot3) /
+  (plot4 | plot5 | plot6 | plot7) 
+```
+
+
+## Analysis of Best Model
+```{r}
+summary(forward_aic)
+coef <- names(coef(forward_aic))[-1]
+coef <- gsub("TRUE", "", coef)
+formula <- as.formula(paste("pressure_play ~", paste(coef, collapse = " + ")))
+test_model <- glm(formula, family = "binomial", data = test)
+summary(test_model)
+```
+
+## Accuracy
+
+```{r}
+predicted <- predict(forward_aic, test, type = 'response') > 0.5
+mean(predicted == test$pressure_play)
+```
+
+
+## Confidence Interval
+
+```{r}
+cintDf<- as.data.frame(confint(test_model)) |>
+  mutate(beta = rownames(confint(test_model)),
+         expected = coef(test_model)) |>
+  filter(beta != "(Intercept)")
+
+cintDf |>
+  ggplot(aes(x = beta, y = expected)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = `2.5 %`, ymax = `97.5 %`)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1)) +
+  labs(x = "Variable Name",
+       y = "Coefficient Value",
+       title = "95% Confidence Interval of Selected Model Variables",
+       caption = "Owen Yoo | Ben Weber | Eliana Detata | Bryce Carson")
+```
+
+## Model Building Plot
+
+```{r}
+aic_val <- forward_aic$anova[, "AIC"]
+coef_added <- (forward_aic$anova)[, "Step"]
+coef_added[1] <- "Nothing Added"
+stepdf <- data.frame(step = 1:length(coef_added),
+                     AIC = aic_val,
+                     var = as.factor(coef_added)) 
+stepdf$var <- factor(stepdf$var, levels = unique(stepdf$var))
+
+stepdf |>
+  ggplot(aes(x = var, y = AIC, group = 1)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1)) +
+  labs(x = "Variable Added",
+       y = "AIC Value",
+       title = "Change in AIC as Variable is Added in Selected Model",
+       caption = "Owen Yoo | Ben Weber | Eliana Detata | Bryce Carson")
+```
+
+
